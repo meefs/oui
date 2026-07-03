@@ -14,56 +14,54 @@ import (
 	"github.com/thatmattlove/go-macaddr"
 )
 
-func DownloadCSV(registry *Registry) (string, error) {
-	client := http.DefaultClient
-	client.Timeout = 30 * time.Second
-
+func fetchCSV(client *http.Client, registry *Registry) (io.ReadCloser, error) {
 	req, err := http.NewRequest(http.MethodGet, registry.URL().String(), nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("user-agent", "oui")
 	res, err := client.Do(req)
 	if err != nil {
 		if os.IsTimeout(err) {
-			return "", fmt.Errorf("request timed out: %w", err)
+			return nil, fmt.Errorf("request timed out: %w", err)
 		}
-		return "", err
+		return nil, err
 	}
-	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("[%s] failed to download data from %s error: [%s] %v", registry.Name, registry.URL(), res.Status, string(b))
+	}
+	return res.Body, nil
+}
 
-	b, err := io.ReadAll(res.Body)
+func DownloadCSV(registry *Registry) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	body, err := fetchCSV(client, registry)
 	if err != nil {
 		return "", err
 	}
-	if res.StatusCode != 200 {
-		return "", fmt.Errorf("[%s] failed to download data from %s error: [%s] %v", registry.Name, registry.URL(), res.Status, string(b))
-	}
+	defer body.Close()
 	file, err := os.CreateTemp("", registry.TempFilePattern())
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	_, err = file.Write(b)
+	_, err = io.Copy(file, body)
+	if err != nil {
+		return "", err
+	}
 	return file.Name(), nil
 }
 
-func ReadCSV(registry *Registry, fileName string, logger LoggerType) ([]*VendorDef, error) {
+func readCSVRows(registry *Registry, r io.Reader, logger LoggerType) ([]*VendorDef, error) {
 	results := make([]*VendorDef, 0)
-	file, err := os.Open(fileName)
-	if err != nil {
-		if logger != nil {
-			logger.Err(err)
-		}
-		return nil, err
-	}
-	defer file.Close()
-	reader := csv.NewReader(file)
+	reader := csv.NewReader(r)
 	reader.LazyQuotes = true
 	var place int64
 	for {
 		var row []string
-		row, err = reader.Read()
+		row, err := reader.Read()
 		if err == io.EOF {
 			// Exit loop when file is done being read.
 			if logger != nil {
@@ -114,7 +112,22 @@ func ReadCSV(registry *Registry, fileName string, logger LoggerType) ([]*VendorD
 	return results, nil
 }
 
-func CollectAll(p *progress.Progress, logger LoggerType) ([]*VendorDef, error) {
+func ReadCSV(registry *Registry, fileName string, logger LoggerType) ([]*VendorDef, error) {
+	file, err := os.Open(fileName)
+	if err != nil {
+		if logger != nil {
+			logger.Err(err)
+		}
+		return nil, err
+	}
+	defer file.Close()
+	return readCSVRows(registry, file, logger)
+}
+
+func collectAll(client *http.Client, p *progress.Progress, logger LoggerType) ([]*VendorDef, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
 	registries := Registries()
 	defs := make([]*VendorDef, 0)
 	errs := make([]error, 0)
@@ -122,14 +135,16 @@ func CollectAll(p *progress.Progress, logger LoggerType) ([]*VendorDef, error) {
 		if p != nil {
 			p.Advance(uint(88 / len(registries)))
 		}
-		fileName, err := DownloadCSV(reg)
+		body, err := fetchCSV(client, reg)
 		if err != nil {
 			errs = append(errs, err)
 			if logger != nil {
 				logger.Err(err, "failed to download file '%s'", reg.FileName())
 			}
+			continue
 		}
-		results, err := ReadCSV(reg, fileName, logger)
+		results, err := readCSVRows(reg, body, logger)
+		body.Close()
 		if err != nil {
 			return nil, err
 		}
@@ -137,4 +152,8 @@ func CollectAll(p *progress.Progress, logger LoggerType) ([]*VendorDef, error) {
 	}
 	err := errors.Join(errs...)
 	return defs, err
+}
+
+func CollectAll(p *progress.Progress, logger LoggerType) ([]*VendorDef, error) {
+	return collectAll(nil, p, logger)
 }

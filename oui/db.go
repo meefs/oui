@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -20,6 +21,8 @@ type OUIDB struct {
 	useLogging  bool
 	useProgress bool
 	dialect     int
+	httpClient  *http.Client
+	inlineRows  int
 }
 
 func tableExists(dialect int, conn *sql.DB, ver string) (bool, error) {
@@ -97,7 +100,62 @@ func (ouidb *OUIDB) Insert(d *VendorDef) (res sql.Result, err error) {
 	return
 }
 
+func escapeSQLString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// bulkInsertInline inserts defs as multi-row INSERT statements with values
+// rendered as escaped SQL literals, bounded by both inlineRows and
+// maxInlineStatementBytes per statement.
+func (ouidb *OUIDB) bulkInsertInline(defs []*VendorDef) (int64, error) {
+	head := fmt.Sprintf("INSERT INTO %s(prefix, length, org, registry) values", ouidb.Version)
+	inserted := int64(0)
+	var sb strings.Builder
+	rows := 0
+
+	flush := func() error {
+		if rows == 0 {
+			return nil
+		}
+		res, err := ouidb.Connection.Exec(sb.String())
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		inserted += n
+		sb.Reset()
+		rows = 0
+		return nil
+	}
+
+	for _, def := range defs {
+		values := fmt.Sprintf("(%s,%d,%s,%s)", escapeSQLString(def.Prefix), def.Length, escapeSQLString(def.Org), escapeSQLString(def.Registry))
+		if rows > 0 && (rows >= ouidb.inlineRows || sb.Len()+len(values)+1 > maxInlineStatementBytes) {
+			if err := flush(); err != nil {
+				return inserted, err
+			}
+		}
+		if rows == 0 {
+			sb.WriteString(head)
+		} else {
+			sb.WriteString(",")
+		}
+		sb.WriteString(values)
+		rows++
+	}
+	if err := flush(); err != nil {
+		return inserted, err
+	}
+	return inserted, nil
+}
+
 func (ouidb *OUIDB) BulkInsert(defs []*VendorDef) (int64, error) {
+	if ouidb.dialect == dialectSqlite && ouidb.inlineRows > 0 {
+		return ouidb.bulkInsertInline(defs)
+	}
 
 	var statement string
 	var tmpl string
@@ -163,7 +221,7 @@ func (ouidb *OUIDB) Populate() (records int64, err error) {
 	if ouidb.useProgress {
 		p = ouidb.Progress
 	}
-	defs, err := CollectAll(p, l)
+	defs, err := collectAll(ouidb.httpClient, p, l)
 	if err != nil {
 		return
 	}
@@ -293,6 +351,8 @@ func New(opts ...Option) (*OUIDB, error) {
 		useLogging:  options.Logger != nil,
 		useProgress: options.Progress != nil,
 		dialect:     options.dialect,
+		httpClient:  options.HTTPClient,
+		inlineRows:  options.InlineRowsPerStatement,
 	}
 	return ouidb, nil
 }

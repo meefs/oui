@@ -31,3 +31,10 @@ const (
 	maxVarsSqlite int = 999
 	maxVarsPsql   int = 65535
 )
+
+const (
+	// Hosted SQLite services such as Cloudflare D1 cap statement size at 100KB;
+	// stay safely under it when inlining values.
+	maxInlineStatementBytes int = 95_000
+	defaultInlineRows       int = 250
+)

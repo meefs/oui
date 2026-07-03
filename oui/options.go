@@ -3,23 +3,21 @@ package oui
 import (
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
+	"net/http"
 	"regexp"
 
 	"github.com/gookit/gcli/v3/progress"
-	_ "github.com/lib/pq"
-	"github.com/thatmattlove/oui/v2/internal/util"
-	_ "modernc.org/sqlite"
 )
 
 type Options struct {
-	Logger         *LoggerType
-	Progress       *progress.Progress
-	Version        string
-	Connection     *sql.DB
-	dialect        int
-	MaxConnections uint
+	Logger                 *LoggerType
+	Progress               *progress.Progress
+	Version                string
+	Connection             *sql.DB
+	dialect                int
+	MaxConnections         uint
+	HTTPClient             *http.Client
+	InlineRowsPerStatement int
 }
 
 type Option func(*Options)
@@ -67,6 +65,39 @@ func WithMaxConnections(max uint) Option {
 	}
 }
 
+// WithSQLiteConnection uses an existing connection that speaks the SQLite
+// dialect, such as a Cloudflare D1 binding, instead of opening one via
+// CreateSQLiteOption.
+func WithSQLiteConnection(conn *sql.DB) Option {
+	return func(opts *Options) {
+		opts.Connection = conn
+		opts.dialect = dialectSqlite
+	}
+}
+
+// WithInlineBulkInsert makes BulkInsert render values as escaped SQL literals
+// instead of bound parameters, chunked at maxRowsPerStatement rows. Use this
+// with backends that cap bound parameters or queries per request (e.g.
+// Cloudflare D1: 100 parameters/statement, 1,000 queries/invocation).
+// A maxRowsPerStatement <= 0 selects the default of 250.
+func WithInlineBulkInsert(maxRowsPerStatement int) Option {
+	return func(opts *Options) {
+		if maxRowsPerStatement <= 0 {
+			maxRowsPerStatement = defaultInlineRows
+		}
+		opts.InlineRowsPerStatement = maxRowsPerStatement
+	}
+}
+
+// WithHTTPClient sets the client used to download registry CSVs during
+// Populate, for environments where the default client is unavailable
+// (e.g. fetch-backed clients on Cloudflare Workers).
+func WithHTTPClient(client *http.Client) Option {
+	return func(opts *Options) {
+		opts.HTTPClient = client
+	}
+}
+
 func getOptions(setters ...Option) *Options {
 	options := &Options{
 		Logger:         nil,
@@ -79,86 +110,4 @@ func getOptions(setters ...Option) *Options {
 		setter(options)
 	}
 	return options
-}
-
-func getFileName() (fn string, err error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return
-	}
-	fn = filepath.Join(dir, "oui", "oui.db")
-	return
-}
-
-func scaffold() (dbf *os.File, dn string, err error) {
-	fn, err := getFileName()
-	if err != nil {
-		return
-	}
-	dn = filepath.Dir(fn)
-
-	err = os.RemoveAll(dn)
-	if err != nil {
-		return
-	}
-	err = os.MkdirAll(dn, 0755)
-	if err != nil {
-		return
-	}
-	defer dbf.Close()
-	dbf, err = os.Create(fn)
-	if err != nil {
-		return
-	}
-	return
-}
-
-func CreateSQLiteOption(optionalFileName ...string) (Option, error) {
-	var fileName string
-	if len(optionalFileName) != 0 {
-		fileName = optionalFileName[0]
-	} else {
-		defaultFileName, err := getFileName()
-		if err != nil {
-			return nil, err
-		}
-		fileName = defaultFileName
-	}
-
-	var conn *sql.DB
-
-	if !util.PathExists(fileName) {
-		_, _, err := scaffold()
-		if err != nil {
-			return nil, err
-		}
-		_conn, err := sql.Open("sqlite", fileName)
-		if err != nil {
-			return nil, err
-		}
-		conn = _conn
-	} else {
-		_conn, err := sql.Open("sqlite", fileName)
-		if err != nil {
-			return nil, err
-		}
-		conn = _conn
-	}
-	opt := func(opts *Options) {
-		opts.Connection = conn
-		opts.dialect = dialectSqlite
-	}
-	return opt, nil
-}
-
-func CreatePostgresOption(connectionString string) (Option, error) {
-	conn, err := sql.Open("postgres", connectionString)
-	if err != nil {
-		return nil, err
-	}
-	opt := func(opts *Options) {
-		opts.Connection = conn
-		opts.dialect = dialectPsql
-	}
-	return opt, nil
 }
